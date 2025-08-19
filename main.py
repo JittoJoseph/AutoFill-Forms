@@ -13,6 +13,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.common.action_chains import ActionChains
 
 
 # ----------------------------
@@ -299,13 +300,56 @@ def select_answer(driver, question_idx: int, answer_idx: int) -> None:
 		if idx0 >= len(options):
 			print("Answer index out of options range; skipping.")
 			return
-		options[idx0].click()
+		el = options[idx0]
+		# Scroll card and element into view
+		driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'nearest'});", card)
+		time.sleep(0.1)
+		try:
+			el.click()
+		except Exception:
+			try:
+				driver.execute_script("arguments[0].click();", el)
+			except Exception:
+				try:
+					parent = el.find_element(By.XPATH, "./ancestor::*[1]")
+					driver.execute_script("arguments[0].click();", parent)
+				except Exception:
+					ActionChains(driver).move_to_element(el).click().perform()
+		# Verify selection
+		selected = (el.get_attribute("aria-checked") or "").lower() == "true"
+		if not selected:
+			# Try one more JS click
+			driver.execute_script("arguments[0].click();", el)
+			time.sleep(0.05)
+			selected = (el.get_attribute("aria-checked") or "").lower() == "true"
+		if not selected:
+			print("   Warning: radio not confirmed selected")
 	else:
 		options = card.find_elements(By.CSS_SELECTOR, "[role='checkbox']")
 		if idx0 >= len(options):
 			print("Answer index out of options range; skipping.")
 			return
-		options[idx0].click()
+		el = options[idx0]
+		driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'nearest'});", card)
+		time.sleep(0.1)
+		try:
+			el.click()
+		except Exception:
+			try:
+				driver.execute_script("arguments[0].click();", el)
+			except Exception:
+				try:
+					parent = el.find_element(By.XPATH, "./ancestor::*[1]")
+					driver.execute_script("arguments[0].click();", parent)
+				except Exception:
+					ActionChains(driver).move_to_element(el).click().perform()
+		selected = (el.get_attribute("aria-checked") or "").lower() == "true"
+		if not selected:
+			driver.execute_script("arguments[0].click();", el)
+			time.sleep(0.05)
+			selected = (el.get_attribute("aria-checked") or "").lower() == "true"
+		if not selected:
+			print("   Warning: checkbox not confirmed selected")
 
 
 # ----------------------------
@@ -314,17 +358,15 @@ def select_answer(driver, question_idx: int, answer_idx: int) -> None:
 def _page_signature(driver) -> str:
 	"""Compute a lightweight signature of current page MCQ layout to detect page changes."""
 	js = """
-	() => {
-	  const cards = Array.from(document.querySelectorAll("div[role='listitem']"));
-	  const parts = cards.map((c) => {
-		const h = c.querySelector("[role='heading']");
-		const qt = h ? h.textContent.trim() : '';
-		const rc = c.querySelectorAll("[role='radio']").length;
-		const cc = c.querySelectorAll("[role='checkbox']").length;
+	var cards = Array.from(document.querySelectorAll("div[role='listitem']"));
+	var parts = cards.map(function(c){
+		var h = c.querySelector("[role='heading']");
+		var qt = h ? h.textContent.trim() : '';
+		var rc = c.querySelectorAll("[role='radio']").length;
+		var cc = c.querySelectorAll("[role='checkbox']").length;
 		return qt + '|' + rc + '|' + cc;
-	  });
-	  return parts.join("||");
-	}
+	});
+	return parts.join("||");
 	"""
 	try:
 		return driver.execute_script(js)
@@ -333,22 +375,71 @@ def _page_signature(driver) -> str:
 
 
 def _has_next_button(driver) -> bool:
-	btns = driver.find_elements(By.XPATH, "//div[@role='button' and .//span[contains(., 'Next')] or contains(., 'Next')]")
+	btns = driver.find_elements(
+		By.XPATH,
+		"//div[@role='button'][.//span[contains(normalize-space(), 'Next')] or contains(normalize-space(), 'Next')]",
+	)
 	return len(btns) > 0
 
 
 def _has_submit_button(driver) -> bool:
-	btns = driver.find_elements(By.XPATH, "//div[@role='button' and .//span[contains(., 'Submit')] or contains(., 'Submit')]")
+	btns = driver.find_elements(
+		By.XPATH,
+		"//div[@role='button'][.//span[contains(normalize-space(), 'Submit')] or contains(normalize-space(), 'Submit')]",
+	)
 	return len(btns) > 0
 
 
 def _wait_for_next_page_after_user_click(driver, prev_sig: str) -> None:
 	print("Waiting for you to click Next... (the bot will continue after the next page loads)")
-	for _ in range(60 * 60 * 2):
-		time.sleep(1)
+	# Use several signals to detect page change reliably
+	prev_url = ""
+	try:
+		prev_url = driver.current_url
+	except Exception:
+		prev_url = ""
+
+	def _first_heading_text() -> str:
+		try:
+			el = driver.find_elements(By.CSS_SELECTOR, "div[role='listitem'] [role='heading']")
+			if el:
+				return (el[0].text or "").strip()
+		except Exception:
+			pass
+		return ""
+
+	def _listitem_count() -> int:
+		try:
+			return len(driver.find_elements(By.CSS_SELECTOR, "div[role='listitem']"))
+		except Exception:
+			return -1
+
+	prev_heading = _first_heading_text()
+	prev_count = _listitem_count()
+
+	for _ in range(60 * 5):  # up to ~5 minutes
+		time.sleep(0.5)
+		# 1) URL change
+		try:
+			if driver.current_url != prev_url and driver.current_url:
+				time.sleep(0.5)
+				return
+		except Exception:
+			pass
+		# 2) Signature change
 		new_sig = _page_signature(driver)
 		if new_sig and new_sig != prev_sig:
-			time.sleep(1)
+			time.sleep(0.5)
+			return
+		# 3) First heading change
+		new_heading = _first_heading_text()
+		if new_heading and new_heading != prev_heading:
+			time.sleep(0.5)
+			return
+		# 4) Question card count change
+		new_count = _listitem_count()
+		if new_count != -1 and new_count != prev_count:
+			time.sleep(0.5)
 			return
 
 
@@ -381,6 +472,8 @@ def run(url: str) -> None:
 			if _has_next_button(driver):
 				print("Next button detected. Please click it manually when ready.")
 				_wait_for_next_page_after_user_click(driver, prev_sig)
+				# give the page a moment to render new content
+				time.sleep(0.5)
 				continue
 
 			if _has_submit_button(driver) or not _has_next_button(driver):

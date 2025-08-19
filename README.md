@@ -14,18 +14,14 @@ GEMINI_API_KEY=your_api_key_here
 3. Install dependencies:
 
 ```
-python -m venv .venv
-.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
 ## Run
 
 ```
-python main.py "<google_form_url>"
+python main.py
 ```
-
-Or run without args and paste the URL when prompted.
 
 ## What it does
 

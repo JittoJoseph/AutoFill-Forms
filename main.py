@@ -36,54 +36,25 @@ def load_env() -> None:
 
 
 def _get_chrome_user_data_dir() -> str:
-	"""Resolve Chrome profile directory on Windows; allow override via CHROME_USER_DATA_DIR env var."""
+	"""Resolve Chrome profile directory on Windows."""
 	override = os.getenv("CHROME_USER_DATA_DIR")
 	if override:
 		return override
-
-	user_profile = os.environ.get("USERPROFILE")
 	local_appdata = os.environ.get("LOCALAPPDATA")
-	base = local_appdata or (os.path.join(user_profile, "AppData", "Local") if user_profile else None)
-	if not base:
-		# Fallback to typical path
-		return r"C:\\Users\\%USERNAME%\\AppData\\Local\\Google\\Chrome\\User Data"
-	return os.path.join(base, "Google", "Chrome", "User Data")
+	if local_appdata:
+		return os.path.join(local_appdata, "Google", "Chrome", "User Data")
+	return r"C:\Users\%USERNAME%\AppData\Local\Google\Chrome\User Data"
 
 
-def _get_default_profile_arg() -> str:
-	"""Default Chrome profile directory name. Allow override via CHROME_PROFILE_NAME."""
-	return os.getenv("CHROME_PROFILE_NAME", "Default")
-
-
-def _find_chrome_exe() -> Optional[str]:
-	"""Best-effort lookup for chrome.exe. Allow override via CHROME_EXE/CHROME_PATH env var."""
-	override = os.getenv("CHROME_EXE") or os.getenv("CHROME_PATH")
-	if override and os.path.exists(override):
-		return override
-	candidates = [
-		os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-		os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
-		os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
-	]
-	for c in candidates:
-		if c and os.path.exists(c):
-			return c
-	return None
-
-
-# ----------------------------
-# Browser (Selenium)
-# ----------------------------
 def _get_edge_user_data_dir() -> str:
+	"""Resolve Edge profile directory on Windows."""
 	override = os.getenv("EDGE_USER_DATA_DIR")
 	if override:
 		return override
-	user_profile = os.environ.get("USERPROFILE")
 	local_appdata = os.environ.get("LOCALAPPDATA")
-	base = local_appdata or (os.path.join(user_profile, "AppData", "Local") if user_profile else None)
-	if not base:
-		return r"C:\\Users\\%USERNAME%\\AppData\\Local\\Microsoft\\Edge\\User Data"
-	return os.path.join(base, "Microsoft", "Edge", "User Data")
+	if local_appdata:
+		return os.path.join(local_appdata, "Microsoft", "Edge", "User Data")
+	return r"C:\Users\%USERNAME%\AppData\Local\Microsoft\Edge\User Data"
 
 
 def _get_profile_name() -> str:
@@ -91,14 +62,17 @@ def _get_profile_name() -> str:
 
 
 def _get_browser_choice() -> str:
-	# 'edge' or 'chrome' (default to edge on Windows since it's the default browser)
 	return os.getenv("BROWSER", "edge").lower()
 
 
+# ----------------------------
+# Browser (Selenium)
+# ----------------------------
 def launch_browser(url: str):
-	"""Launch device's browser with existing user profile using Selenium (no greenlet)."""
+	"""Launch browser with existing user profile using Selenium."""
 	choice = _get_browser_choice()
 	profile = _get_profile_name()
+	
 	if choice == "chrome":
 		user_data_dir = _get_chrome_user_data_dir()
 		print(f"Launching Chrome with profile: {user_data_dir} ({profile})")
@@ -106,8 +80,6 @@ def launch_browser(url: str):
 		opts.add_argument(f"--user-data-dir={user_data_dir}")
 		opts.add_argument(f"--profile-directory={profile}")
 		opts.add_argument("--no-first-run")
-		opts.add_argument("--no-default-browser-check")
-		# Reduce noisy console logs and automation banner
 		opts.add_argument("--log-level=3")
 		opts.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
 		opts.add_experimental_option("useAutomationExtension", False)
@@ -119,8 +91,6 @@ def launch_browser(url: str):
 		opts.add_argument(f"--user-data-dir={user_data_dir}")
 		opts.add_argument(f"--profile-directory={profile}")
 		opts.add_argument("--no-first-run")
-		opts.add_argument("--no-default-browser-check")
-		# Reduce noisy console logs and automation banner
 		opts.add_argument("--log-level=3")
 		try:
 			opts.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
@@ -130,11 +100,7 @@ def launch_browser(url: str):
 		driver = webdriver.Edge(options=opts)
 
 	driver.get(url)
-	try:
-		WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-	except Exception:
-		pass
-	time.sleep(1)
+	WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 	return driver
 
 
@@ -144,66 +110,37 @@ def launch_browser(url: str):
 def extract_mcqs(driver) -> List[MCQ]:
 	"""Extract MCQ questions (radio or checkboxes) from the current Google Form page."""
 	mcqs: List[MCQ] = []
-
-	# Google Forms typically puts each question in a listitem
 	question_cards = driver.find_elements(By.CSS_SELECTOR, "div[role='listitem']")
+	
 	for card in question_cards:
-
-		# Get question heading text
+		# Get question text
 		q_headings = card.find_elements(By.CSS_SELECTOR, "[role='heading']")
-		question_text = ""
-		if q_headings:
-			question_text = (q_headings[0].text or "").strip()
-		else:
-			# Fallback: try visible text within the card
-			try:
-				question_text = (card.text or "").split("\n")[0].strip()
-			except Exception:
-				question_text = ""
+		question_text = q_headings[0].text.strip() if q_headings else card.text.split("\n")[0].strip()
+		if not question_text:
+			continue
 
-		# Determine type and collect options
-		# Radio group (single choice)
+		# Check for radio buttons
 		radio_groups = card.find_elements(By.CSS_SELECTOR, "[role='radiogroup']")
-		radios = []
 		if radio_groups:
-			radio_options = radio_groups[0].find_elements(By.CSS_SELECTOR, "[role='radio']")
-			for opt in radio_options:
-				label = (opt.get_attribute("aria-label") or "").strip()
-				if not label:
-					try:
-						label = (opt.text or "").strip()
-						if not label:
-							spans = opt.find_elements(By.XPATH, "./ancestor::*[1]//span")
-							if spans:
-								label = (spans[-1].text or "").strip()
-					except Exception:
-						label = ""
-				if label:
-					radios.append(label)
-			if radios:
-				mcqs.append(MCQ(kind="radio", question_text=question_text, options=radios))
+			options = []
+			for opt in radio_groups[0].find_elements(By.CSS_SELECTOR, "[role='radio']"):
+				label = opt.get_attribute("aria-label") or opt.text or ""
+				if label.strip():
+					options.append(label.strip())
+			if options:
+				mcqs.append(MCQ(kind="radio", question_text=question_text, options=options))
 				continue
 
-		# Checkbox group (multiple choice)
-		# In Google Forms, checkboxes appear as elements with role='checkbox' within the card
-		checkbox_options = card.find_elements(By.CSS_SELECTOR, "[role='checkbox']")
-		checks: List[str] = []
-		if checkbox_options:
-			for opt in checkbox_options:
-				label = (opt.get_attribute("aria-label") or "").strip()
-				if not label:
-					try:
-						label = (opt.text or "").strip()
-						if not label:
-							spans = opt.find_elements(By.XPATH, "./ancestor::*[1]//span")
-							if spans:
-								label = (spans[-1].text or "").strip()
-					except Exception:
-						label = ""
-				if label:
-					checks.append(label)
-			if checks:
-				mcqs.append(MCQ(kind="checkbox", question_text=question_text, options=checks))
+		# Check for checkboxes
+		checkboxes = card.find_elements(By.CSS_SELECTOR, "[role='checkbox']")
+		if checkboxes:
+			options = []
+			for opt in checkboxes:
+				label = opt.get_attribute("aria-label") or opt.text or ""
+				if label.strip():
+					options.append(label.strip())
+			if options:
+				mcqs.append(MCQ(kind="checkbox", question_text=question_text, options=options))
 
 	print(f"Detected {len(mcqs)} MCQ question(s) on this page.")
 	return mcqs
@@ -220,7 +157,7 @@ def _coerce_api_key(val: Optional[str]) -> Optional[str]:
 
 
 def ask_gemini(question: str, options: List[str]) -> int:
-	"""Ask Gemini Flash for the best option index (1-based). Falls back to 1 on error."""
+	"""Ask Gemini Flash for the best option index (1-based) with retry logic."""
 	api_key = _coerce_api_key(os.getenv("GEMINI_API_KEY"))
 	if not api_key:
 		print("GEMINI_API_KEY is not set. Defaulting to option 1.")
@@ -232,124 +169,95 @@ def ask_gemini(question: str, options: List[str]) -> int:
 		"\nRespond ONLY with the number of the best option."
 	)
 
-	url = (
-		"https://generativelanguage.googleapis.com/v1beta/models/"
-		"gemini-2.0-flash:generateContent"
-	)
-	headers = {
-		"Content-Type": "application/json",
-		"X-goog-api-key": api_key,
-	}
-	body = {
-		"contents": [
-			{"parts": [{"text": prompt}]}
-		]
-	}
+	url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+	headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
+	body = {"contents": [{"parts": [{"text": prompt}]}]}
 
-	try:
-		resp = requests.post(url, headers=headers, json=body, timeout=30)
-		resp.raise_for_status()
-		data = resp.json()
-		text = (
-			data.get("candidates", [{}])[0]
-			.get("content", {})
-			.get("parts", [{}])[0]
-			.get("text", "")
-		)
-		# Extract first integer in response
-		m = re.search(r"(\d+)", str(text))
-		if not m:
-			raise ValueError("No number in response")
-		idx = int(m.group(1))
-		if idx < 1 or idx > len(options):
-			print(
-				f"Gemini returned out-of-range index {idx}. Clamping to 1..{len(options)}."
-			)
-			idx = max(1, min(idx, len(options)))
-		return idx
-	except Exception as e:
-		print(f"Gemini API error: {e}. Defaulting to option 1.")
-		return 1
+	for attempt in range(3):
+		try:
+			resp = requests.post(url, headers=headers, json=body, timeout=30)
+			resp.raise_for_status()
+			data = resp.json()
+			text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+			
+			m = re.search(r"(\d+)", str(text))
+			if not m:
+				raise ValueError("No number in response")
+			idx = int(m.group(1))
+			if idx < 1 or idx > len(options):
+				print(f"Gemini returned out-of-range index {idx}. Clamping to 1..{len(options)}.")
+				idx = max(1, min(idx, len(options)))
+			return idx
+		except requests.exceptions.HTTPError as e:
+			if e.response.status_code == 429:  # Rate limit
+				wait_times = [10, 8, 8]
+				wait_time = wait_times[attempt]
+				print(f"Rate limited. Retrying in {wait_time}s... (attempt {attempt + 1}/3)")
+				time.sleep(wait_time)
+				continue
+			else:
+				print(f"Gemini API error: {e}. Defaulting to option 1.")
+				return 1
+		except Exception as e:
+			if attempt < 2:
+				wait_times = [10, 8, 8]
+				wait_time = wait_times[attempt]
+				print(f"API error: {e}. Retrying in {wait_time}s...")
+				time.sleep(wait_time)
+				continue
+			else:
+				print(f"Gemini API error after retries: {e}. Defaulting to option 1.")
+				return 1
+	
+	return 1
 
 
 # ----------------------------
 # Selection
 # ----------------------------
 def select_answer(driver, question_idx: int, answer_idx: int) -> None:
-	"""Click the chosen answer on the page. question_idx is zero-based, answer_idx is one-based."""
-	# Re-find the card to avoid stale references
+	"""Click the chosen answer on the page."""
 	cards = driver.find_elements(By.CSS_SELECTOR, "div[role='listitem']")
-	mcq_positions: List[Tuple[str, int]] = []
-	for i, card in enumerate(cards):
-		if card.find_elements(By.CSS_SELECTOR, "[role='radiogroup']"):
-			mcq_positions.append(("radio", i))
-		elif card.find_elements(By.CSS_SELECTOR, "[role='checkbox']"):
-			mcq_positions.append(("checkbox", i))
-
-	if question_idx >= len(mcq_positions):
-		print(f"Question index {question_idx} out of range; skipping selection.")
+	mcq_cards = [i for i, card in enumerate(cards) 
+				 if card.find_elements(By.CSS_SELECTOR, "[role='radiogroup'], [role='checkbox']")]
+	
+	if question_idx >= len(mcq_cards):
+		print(f"Question index {question_idx} out of range; skipping.")
 		return
 
-	kind, card_i = mcq_positions[question_idx]
-	card = cards[card_i]
+	card = cards[mcq_cards[question_idx]]
 	idx0 = max(0, answer_idx - 1)
 
-	if kind == "radio":
-		group = card.find_elements(By.CSS_SELECTOR, "[role='radiogroup']")[0]
-		options = group.find_elements(By.CSS_SELECTOR, "[role='radio']")
-		if idx0 >= len(options):
-			print("Answer index out of options range; skipping.")
-			return
-		el = options[idx0]
-		# Scroll card and element into view
-		driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'nearest'});", card)
-		time.sleep(0.1)
-		try:
-			el.click()
-		except Exception:
-			try:
-				driver.execute_script("arguments[0].click();", el)
-			except Exception:
-				try:
-					parent = el.find_element(By.XPATH, "./ancestor::*[1]")
-					driver.execute_script("arguments[0].click();", parent)
-				except Exception:
-					ActionChains(driver).move_to_element(el).click().perform()
-		# Verify selection
-		selected = (el.get_attribute("aria-checked") or "").lower() == "true"
-		if not selected:
-			# Try one more JS click
-			driver.execute_script("arguments[0].click();", el)
-			time.sleep(0.05)
-			selected = (el.get_attribute("aria-checked") or "").lower() == "true"
-		if not selected:
-			print("   Warning: radio not confirmed selected")
+	# Find the appropriate option element
+	radio_group = card.find_elements(By.CSS_SELECTOR, "[role='radiogroup']")
+	if radio_group:
+		options = radio_group[0].find_elements(By.CSS_SELECTOR, "[role='radio']")
 	else:
 		options = card.find_elements(By.CSS_SELECTOR, "[role='checkbox']")
-		if idx0 >= len(options):
-			print("Answer index out of options range; skipping.")
-			return
-		el = options[idx0]
-		driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'nearest'});", card)
-		time.sleep(0.1)
+	
+	if idx0 >= len(options):
+		print("Answer index out of range; skipping.")
+		return
+
+	# Click with retry
+	el = options[idx0]
+	driver.execute_script("arguments[0].scrollIntoView({block:'center'});", card)
+	
+	for attempt in range(3):
 		try:
-			el.click()
-		except Exception:
-			try:
+			if attempt == 0:
+				el.click()
+			else:
 				driver.execute_script("arguments[0].click();", el)
-			except Exception:
-				try:
-					parent = el.find_element(By.XPATH, "./ancestor::*[1]")
-					driver.execute_script("arguments[0].click();", parent)
-				except Exception:
-					ActionChains(driver).move_to_element(el).click().perform()
-		selected = (el.get_attribute("aria-checked") or "").lower() == "true"
-		if not selected:
-			driver.execute_script("arguments[0].click();", el)
-			time.sleep(0.05)
-			selected = (el.get_attribute("aria-checked") or "").lower() == "true"
-		if not selected:
-			print("   Warning: checkbox not confirmed selected")
+			
+			# Verify selection
+			if el.get_attribute("aria-checked") == "true":
+				return
+			time.sleep(0.1)
+		except Exception:
+			time.sleep(0.1)
+	
+	print("   Warning: selection may have failed")
 
 
 # ----------------------------
@@ -375,71 +283,20 @@ def _page_signature(driver) -> str:
 
 
 def _has_next_button(driver) -> bool:
-	btns = driver.find_elements(
-		By.XPATH,
-		"//div[@role='button'][.//span[contains(normalize-space(), 'Next')] or contains(normalize-space(), 'Next')]",
-	)
-	return len(btns) > 0
+	return len(driver.find_elements(By.XPATH, "//div[@role='button']//span[contains(text(), 'Next')]")) > 0
 
 
 def _has_submit_button(driver) -> bool:
-	btns = driver.find_elements(
-		By.XPATH,
-		"//div[@role='button'][.//span[contains(normalize-space(), 'Submit')] or contains(normalize-space(), 'Submit')]",
-	)
-	return len(btns) > 0
+	return len(driver.find_elements(By.XPATH, "//div[@role='button']//span[contains(text(), 'Submit')]")) > 0
 
 
-def _wait_for_next_page_after_user_click(driver, prev_sig: str) -> None:
-	print("Waiting for you to click Next... (the bot will continue after the next page loads)")
-	# Use several signals to detect page change reliably
-	prev_url = ""
-	try:
-		prev_url = driver.current_url
-	except Exception:
-		prev_url = ""
-
-	def _first_heading_text() -> str:
-		try:
-			el = driver.find_elements(By.CSS_SELECTOR, "div[role='listitem'] [role='heading']")
-			if el:
-				return (el[0].text or "").strip()
-		except Exception:
-			pass
-		return ""
-
-	def _listitem_count() -> int:
-		try:
-			return len(driver.find_elements(By.CSS_SELECTOR, "div[role='listitem']"))
-		except Exception:
-			return -1
-
-	prev_heading = _first_heading_text()
-	prev_count = _listitem_count()
-
-	for _ in range(60 * 5):  # up to ~5 minutes
-		time.sleep(0.5)
-		# 1) URL change
-		try:
-			if driver.current_url != prev_url and driver.current_url:
-				time.sleep(0.5)
-				return
-		except Exception:
-			pass
-		# 2) Signature change
+def _wait_for_next_page(driver, prev_sig: str) -> None:
+	print("Waiting for you to click Next...")
+	for _ in range(300):  # 5 minutes max
+		time.sleep(1)
 		new_sig = _page_signature(driver)
-		if new_sig and new_sig != prev_sig:
-			time.sleep(0.5)
-			return
-		# 3) First heading change
-		new_heading = _first_heading_text()
-		if new_heading and new_heading != prev_heading:
-			time.sleep(0.5)
-			return
-		# 4) Question card count change
-		new_count = _listitem_count()
-		if new_count != -1 and new_count != prev_count:
-			time.sleep(0.5)
+		if new_sig != prev_sig:
+			time.sleep(1)  # Let page settle
 			return
 
 
@@ -471,12 +328,10 @@ def run(url: str) -> None:
 			prev_sig = _page_signature(driver)
 			if _has_next_button(driver):
 				print("Next button detected. Please click it manually when ready.")
-				_wait_for_next_page_after_user_click(driver, prev_sig)
-				# give the page a moment to render new content
-				time.sleep(0.5)
+				_wait_for_next_page(driver, prev_sig)
 				continue
 
-			if _has_submit_button(driver) or not _has_next_button(driver):
+			if _has_submit_button(driver):
 				print("\nAll MCQs answered. Please review and click Submit manually.")
 				return
 	finally:
@@ -485,20 +340,11 @@ def run(url: str) -> None:
 
 
 def main():
-	# Contract: Reads URL from argv or prompts user, loads env, then runs async flow
 	print("Google Forms MCQ Auto-Answer (Gemini Flash)")
 	load_env()
-	url = None
-	if len(sys.argv) > 1:
-		url = sys.argv[1]
-	while not url:
-		url = input("Enter Google Form URL: ").strip()
+	url = sys.argv[1] if len(sys.argv) > 1 else input("Enter Google Form URL: ").strip()
 	run(url)
-	# Keep process alive so the browser stays open for review
-	try:
-		input("\nAll MCQs answered. Please review and click Submit manually.\nPress Enter here to close the helper...")
-	except EOFError:
-		pass
+	input("\nPress Enter to close...")
 
 
 if __name__ == "__main__":

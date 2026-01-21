@@ -27,6 +27,10 @@ class MCQ:
 	# Internal locators are resolved by index during selection; we keep only indices
 
 
+# Global state for API key switching
+current_api_key_idx = 0
+
+
 # ----------------------------
 # Environment
 # ----------------------------
@@ -158,6 +162,7 @@ def _coerce_api_key(val: Optional[str]) -> Optional[str]:
 
 def ask_gemini(question: str, options: List[str]) -> int:
 	"""Ask Gemini Flash for the best option index (1-based) with retry logic and key switching."""
+	global current_api_key_idx
 	keys = [
 		_coerce_api_key(os.getenv("GEMINI_API_KEY")),
 		_coerce_api_key(os.getenv("GEMINI_API_KEY_2"))
@@ -174,7 +179,7 @@ def ask_gemini(question: str, options: List[str]) -> int:
 
 	url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 	
-	current_idx = 0
+	current_idx = current_api_key_idx
 	for attempt in range(10):  # Allow more attempts for switching
 		api_key = keys[current_idx]
 		headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
@@ -198,7 +203,8 @@ def ask_gemini(question: str, options: List[str]) -> int:
 			if e.response.status_code == 429:  # Rate limit
 				print(f"Rate limited on key {current_idx + 1}. Switching to other key in 5s...")
 				time.sleep(5)
-				current_idx = 1 - current_idx  # Switch to the other key
+				current_api_key_idx = 1 - current_idx
+				current_idx = current_api_key_idx
 				continue
 			else:
 				print(f"Gemini API error: {e}. Defaulting to option 1.")

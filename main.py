@@ -157,10 +157,13 @@ def _coerce_api_key(val: Optional[str]) -> Optional[str]:
 
 
 def ask_gemini(question: str, options: List[str]) -> int:
-	"""Ask Gemini Flash for the best option index (1-based) with retry logic."""
-	api_key = _coerce_api_key(os.getenv("GEMINI_API_KEY"))
-	if not api_key:
-		print("GEMINI_API_KEY is not set. Defaulting to option 1.")
+	"""Ask Gemini Flash for the best option index (1-based) with retry logic and key switching."""
+	keys = [
+		_coerce_api_key(os.getenv("GEMINI_API_KEY")),
+		_coerce_api_key(os.getenv("GEMINI_API_KEY_2"))
+	]
+	if not all(keys):
+		print("API keys not set. Defaulting to option 1.")
 		return 1
 
 	prompt = (
@@ -170,10 +173,13 @@ def ask_gemini(question: str, options: List[str]) -> int:
 	)
 
 	url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-	headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
-	body = {"contents": [{"parts": [{"text": prompt}]}]}
+	
+	current_idx = 0
+	for attempt in range(10):  # Allow more attempts for switching
+		api_key = keys[current_idx]
+		headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
+		body = {"contents": [{"parts": [{"text": prompt}]}]}
 
-	for attempt in range(3):
 		try:
 			resp = requests.post(url, headers=headers, json=body, timeout=30)
 			resp.raise_for_status()
@@ -190,20 +196,17 @@ def ask_gemini(question: str, options: List[str]) -> int:
 			return idx
 		except requests.exceptions.HTTPError as e:
 			if e.response.status_code == 429:  # Rate limit
-				wait_times = [10, 8, 8]
-				wait_time = wait_times[attempt]
-				print(f"Rate limited. Retrying in {wait_time}s... (attempt {attempt + 1}/3)")
-				time.sleep(wait_time)
+				print(f"Rate limited on key {current_idx + 1}. Switching to other key in 5s...")
+				time.sleep(5)
+				current_idx = 1 - current_idx  # Switch to the other key
 				continue
 			else:
 				print(f"Gemini API error: {e}. Defaulting to option 1.")
 				return 1
 		except Exception as e:
-			if attempt < 2:
-				wait_times = [10, 8, 8]
-				wait_time = wait_times[attempt]
-				print(f"API error: {e}. Retrying in {wait_time}s...")
-				time.sleep(wait_time)
+			if attempt < 9:
+				print(f"API error: {e}. Retrying in 2s...")
+				time.sleep(2)
 				continue
 			else:
 				print(f"Gemini API error after retries: {e}. Defaulting to option 1.")

@@ -2,11 +2,12 @@ import os
 import re
 import sys
 import time
+import json
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import requests
 from dotenv import load_dotenv
+from google import genai
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -163,60 +164,62 @@ def _coerce_api_key(val: Optional[str]) -> Optional[str]:
 def ask_gemini(question: str, options: List[str]) -> int:
 	"""Ask Gemini Flash for the best option index (1-based) with retry logic and key switching."""
 	global current_api_key_idx
-	keys = [
-		_coerce_api_key(os.getenv("GEMINI_API_KEY")),
-		_coerce_api_key(os.getenv("GEMINI_API_KEY_2"))
-	]
-	if not all(keys):
-		print("API keys not set. Defaulting to option 1.")
+	keys = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
+	if not keys:
+		# Fallback to old env vars
+		keys = [_coerce_api_key(os.getenv("GEMINI_API_KEY")), _coerce_api_key(os.getenv("GEMINI_API_KEY_2"))]
+		keys = [k for k in keys if k]
+	if not keys:
+		print("No API keys set. Defaulting to option 1.")
 		return 1
+
+	models = ["gemini-3-flash-preview", "gemini-2.5-flash"]  # Priority order
 
 	prompt = (
 		f"Question: {question}\nOptions:\n" +
 		"\n".join([f"{i+1}. {opt}" for i, opt in enumerate(options)]) +
-		"\nRespond ONLY with the number of the best option."
+		"\nRespond with a JSON object: {\"answer\": <number>}"
 	)
 
-	url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-	
 	current_idx = current_api_key_idx
-	for attempt in range(10):  # Allow more attempts for switching
+	for attempt in range(20):  # Increased attempts
 		api_key = keys[current_idx]
-		headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
-		body = {"contents": [{"parts": [{"text": prompt}]}]}
+		client = genai.Client(api_key=api_key)
+		switch_key = False
 
-		try:
-			resp = requests.post(url, headers=headers, json=body, timeout=30)
-			resp.raise_for_status()
-			data = resp.json()
-			text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-			
-			m = re.search(r"(\d+)", str(text))
-			if not m:
-				raise ValueError("No number in response")
-			idx = int(m.group(1))
-			if idx < 1 or idx > len(options):
-				print(f"Gemini returned out-of-range index {idx}. Clamping to 1..{len(options)}.")
-				idx = max(1, min(idx, len(options)))
-			return idx
-		except requests.exceptions.HTTPError as e:
-			if e.response.status_code == 429:  # Rate limit
-				print(f"Rate limited on key {current_idx + 1}. Switching to other key in 5s...")
-				time.sleep(5)
-				current_api_key_idx = 1 - current_idx
-				current_idx = current_api_key_idx
-				continue
-			else:
-				print(f"Gemini API error: {e}. Defaulting to option 1.")
-				return 1
-		except Exception as e:
-			if attempt < 9:
-				print(f"API error: {e}. Retrying in 2s...")
-				time.sleep(2)
-				continue
-			else:
-				print(f"Gemini API error after retries: {e}. Defaulting to option 1.")
-				return 1
+		for model in models:
+			try:
+				response = client.models.generate_content(model=model, contents=prompt)
+				text = "".join([part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')])
+				
+				# Parse JSON or fallback to regex
+				try:
+					data = json.loads(text.strip())
+					idx = int(data["answer"])
+				except (json.JSONDecodeError, KeyError, ValueError):
+					m = re.search(r"(\d+)", str(text))
+					if not m:
+						continue  # Try next model
+					idx = int(m.group(1))
+				
+				if 1 <= idx <= len(options):
+					return idx
+				else:
+					continue  # Invalid index, try next
+			except Exception as e:
+				if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+					print(f"Quota exceeded on {model} with key {current_idx + 1}. Switching to next key...")
+					switch_key = True
+					break  # Break model loop, switch key immediately
+				else:
+					print(f"Error with {model}: {e}. Trying next model...")
+					continue  # Try next model
+
+		# If we didn't return an answer, rotate key and try again
+		current_api_key_idx = (current_idx + 1) % len(keys)
+		current_idx = current_api_key_idx
+		if switch_key:
+			continue
 	
 	return 1
 
@@ -313,6 +316,7 @@ def _wait_for_next_page(driver, prev_sig: str) -> None:
 # Main flow
 # ----------------------------
 def run(url: str) -> None:
+	skipped_questions = []
 	driver = launch_browser(url)
 	try:
 		visited = 0
@@ -326,13 +330,17 @@ def run(url: str) -> None:
 					continue
 				print(f"Q{i+1}: {q.question_text[:80]}{'...' if len(q.question_text) > 80 else ''}")
 				print(f" - Options: {len(q.options)}")
-				ans_idx = ask_gemini(q.question_text, q.options)
-				print(f" - Gemini suggests option #{ans_idx}")
 				try:
-					select_answer(driver, i, ans_idx)
-					time.sleep(0.2)
-				except Exception as e:
-					print(f" - Selection error: {e}")
+					ans_idx = ask_gemini(q.question_text, q.options)
+					print(f" - Gemini suggests option #{ans_idx}")
+					try:
+						select_answer(driver, i, ans_idx)
+						time.sleep(0.2)
+					except Exception as e:
+						print(f" - Selection error: {e}")
+				except ValueError as e:
+					print(f" - Failed to get answer: {e}. Skipping question.")
+					skipped_questions.append(f"Page {visited}, Q{i+1}: {q.question_text[:50]}...")
 
 			prev_sig = _page_signature(driver)
 			if _has_next_button(driver):
@@ -342,7 +350,11 @@ def run(url: str) -> None:
 
 			if _has_submit_button(driver):
 				print("\nAll MCQs answered. Please review and click Submit manually.")
-				return
+				break
+		if skipped_questions:
+			print("\nSkipped questions (failed to answer):")
+			for sq in skipped_questions:
+				print(f" - {sq}")
 	finally:
 		# Do not close; keep open for review
 		pass

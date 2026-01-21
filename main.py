@@ -169,7 +169,7 @@ def ask_gemini(question: str, options: List[str]) -> int:
 		"\nRespond ONLY with the number of the best option."
 	)
 
-	url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+	url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 	headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
 	body = {"contents": [{"parts": [{"text": prompt}]}]}
 

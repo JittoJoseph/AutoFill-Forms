@@ -2,12 +2,7 @@ import os
 import re
 import sys
 import time
-import json
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
-
-from dotenv import load_dotenv
-from google import genai
+from typing import List
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -16,28 +11,10 @@ from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.action_chains import ActionChains
 
-
-# ----------------------------
-# Data structures
-# ----------------------------
-@dataclass
-class MCQ:
-	kind: str  # 'radio' or 'checkbox'
-	question_text: str
-	options: List[str]
-	# Internal locators are resolved by index during selection; we keep only indices
-
-
-# Global state for API key switching
-current_api_key_idx = 0
-
-
-# ----------------------------
-# Environment
-# ----------------------------
-def load_env() -> None:
-	"""Load environment variables from .env (GEMINI_API_KEY)."""
-	load_dotenv()
+from config import get_webhook_url, load_env
+from discord_notifier import send_discord_batch
+from gemini_client import ask_gemini_batch
+from models import MCQ
 
 
 def _get_chrome_user_data_dir() -> str:
@@ -152,96 +129,6 @@ def extract_mcqs(driver) -> List[MCQ]:
 
 
 # ----------------------------
-# Gemini API
-# ----------------------------
-def _coerce_api_key(val: Optional[str]) -> Optional[str]:
-	if not val:
-		return None
-	# Strip any surrounding quotes
-	return val.strip().strip('"').strip("'")
-
-
-
-def ask_gemini_batch(questions: List[MCQ]) -> List[Optional[int]]:
-	"""Ask Gemini for a batch of questions. Returns 1-based indices or None when unresolved."""
-	global current_api_key_idx
-	keys = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
-	if not keys:
-		# Fallback to old env vars
-		keys = [_coerce_api_key(os.getenv("GEMINI_API_KEY")), _coerce_api_key(os.getenv("GEMINI_API_KEY_2"))]
-		keys = [k for k in keys if k]
-	if not keys:
-		print("No API keys set. Skipping batch.")
-		return [None for _ in questions]
-
-	models = ["gemini-3-flash-preview", "gemini-2.5-flash"]  # Priority order
-
-	items = []
-	for i, q in enumerate(questions, start=1):
-		opts = "\n".join([f"{j+1}. {opt}" for j, opt in enumerate(q.options)])
-		items.append(f"Q{i}: {q.question_text}\nOptions:\n{opts}")
-
-	prompt = (
-		"You are answering multiple-choice questions. "
-		"Return ONLY valid JSON in this exact format: "
-		"{\"answers\":[{\"q\":1,\"answer\":<number>},...]}\n"
-		"Rules:\n"
-		"- answer must be the option number (1-based)\n"
-		"- include every question exactly once\n"
-		"- no extra keys, no markdown, no commentary\n\n"
-		+ "\n\n".join(items)
-	)
-
-	current_idx = current_api_key_idx
-	for attempt in range(20):  # Increased attempts
-		api_key = keys[current_idx]
-		client = genai.Client(api_key=api_key)
-		switch_key = False
-
-		for model in models:
-			try:
-				response = client.models.generate_content(model=model, contents=prompt)
-				text = "".join([part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')])
-
-				try:
-					data = json.loads(text.strip())
-				except json.JSONDecodeError:
-					continue  # Try next model
-
-				answers = [None for _ in questions]
-				for item in data.get("answers", []):
-					try:
-						q_idx = int(item.get("q")) - 1
-						ans = int(item.get("answer"))
-						if 0 <= q_idx < len(questions) and 1 <= ans <= len(questions[q_idx].options):
-							answers[q_idx] = ans
-					except Exception:
-						continue
-
-				# If we got at least one valid answer, return the list
-				if any(a is not None for a in answers):
-					return answers
-				else:
-					continue
-			except Exception as e:
-				if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
-					print(f"Quota exceeded on {model} with key {current_idx + 1}. Switching to next key...")
-					switch_key = True
-					break  # Break model loop, switch key immediately
-				else:
-					print(f"Error with {model}: {e}. Trying next model...")
-					continue  # Try next model
-
-		# If we didn't return an answer, rotate key and try again
-		current_api_key_idx = (current_idx + 1) % len(keys)
-		current_idx = current_api_key_idx
-		if switch_key:
-			continue
-
-	return [None for _ in questions]
-
-
-# ----------------------------
 # Selection
 # ----------------------------
 def select_answer(driver, question_idx: int, answer_idx: int) -> None:
@@ -334,6 +221,7 @@ def _wait_for_next_page(driver, prev_sig: str) -> None:
 # ----------------------------
 def run(url: str) -> None:
 	skipped_questions = []
+	webhook_url = get_webhook_url()
 	driver = launch_browser(url)
 	try:
 		visited = 0
@@ -346,6 +234,7 @@ def run(url: str) -> None:
 			for start in range(0, len(mcqs), batch_size):
 				batch = mcqs[start:start + batch_size]
 				answers = ask_gemini_batch(batch)
+				batch_results = []
 				for j, q in enumerate(batch):
 					q_idx = start + j
 					ans_idx = answers[j] if j < len(answers) else None
@@ -354,13 +243,27 @@ def run(url: str) -> None:
 					if ans_idx is None:
 						print(" - Failed to get answer. Skipping question.")
 						skipped_questions.append(f"Page {visited}, Q{q_idx+1}: {q.question_text[:50]}...")
+						batch_results.append({
+							"question_number": q_idx + 1,
+							"question": q.question_text,
+							"answer_number": None,
+							"answer_text": None,
+						})
 						continue
 					print(f" - Gemini suggests option #{ans_idx}")
+					batch_results.append({
+						"question_number": q_idx + 1,
+						"question": q.question_text,
+						"answer_number": ans_idx,
+						"answer_text": q.options[ans_idx - 1] if 1 <= ans_idx <= len(q.options) else None,
+					})
 					try:
 						select_answer(driver, q_idx, ans_idx)
 						time.sleep(0.2)
 					except Exception as e:
 						print(f" - Selection error: {e}")
+
+				send_discord_batch(webhook_url, visited, start + 1, batch_results)
 
 			prev_sig = _page_signature(driver)
 			if _has_next_button(driver):

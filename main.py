@@ -161,8 +161,9 @@ def _coerce_api_key(val: Optional[str]) -> Optional[str]:
 	return val.strip().strip('"').strip("'")
 
 
-def ask_gemini(question: str, options: List[str]) -> int:
-	"""Ask Gemini Flash for the best option index (1-based) with retry logic and key switching."""
+
+def ask_gemini_batch(questions: List[MCQ]) -> List[Optional[int]]:
+	"""Ask Gemini for a batch of questions. Returns 1-based indices or None when unresolved."""
 	global current_api_key_idx
 	keys = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
 	if not keys:
@@ -170,15 +171,25 @@ def ask_gemini(question: str, options: List[str]) -> int:
 		keys = [_coerce_api_key(os.getenv("GEMINI_API_KEY")), _coerce_api_key(os.getenv("GEMINI_API_KEY_2"))]
 		keys = [k for k in keys if k]
 	if not keys:
-		print("No API keys set. Defaulting to option 1.")
-		return 1
+		print("No API keys set. Skipping batch.")
+		return [None for _ in questions]
 
 	models = ["gemini-3-flash-preview", "gemini-2.5-flash"]  # Priority order
 
+	items = []
+	for i, q in enumerate(questions, start=1):
+		opts = "\n".join([f"{j+1}. {opt}" for j, opt in enumerate(q.options)])
+		items.append(f"Q{i}: {q.question_text}\nOptions:\n{opts}")
+
 	prompt = (
-		f"Question: {question}\nOptions:\n" +
-		"\n".join([f"{i+1}. {opt}" for i, opt in enumerate(options)]) +
-		"\nRespond with a JSON object: {\"answer\": <number>}"
+		"You are answering multiple-choice questions. "
+		"Return ONLY valid JSON in this exact format: "
+		"{\"answers\":[{\"q\":1,\"answer\":<number>},...]}\n"
+		"Rules:\n"
+		"- answer must be the option number (1-based)\n"
+		"- include every question exactly once\n"
+		"- no extra keys, no markdown, no commentary\n\n"
+		+ "\n\n".join(items)
 	)
 
 	current_idx = current_api_key_idx
@@ -191,21 +202,27 @@ def ask_gemini(question: str, options: List[str]) -> int:
 			try:
 				response = client.models.generate_content(model=model, contents=prompt)
 				text = "".join([part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')])
-				
-				# Parse JSON or fallback to regex
+
 				try:
 					data = json.loads(text.strip())
-					idx = int(data["answer"])
-				except (json.JSONDecodeError, KeyError, ValueError):
-					m = re.search(r"(\d+)", str(text))
-					if not m:
-						continue  # Try next model
-					idx = int(m.group(1))
-				
-				if 1 <= idx <= len(options):
-					return idx
+				except json.JSONDecodeError:
+					continue  # Try next model
+
+				answers = [None for _ in questions]
+				for item in data.get("answers", []):
+					try:
+						q_idx = int(item.get("q")) - 1
+						ans = int(item.get("answer"))
+						if 0 <= q_idx < len(questions) and 1 <= ans <= len(questions[q_idx].options):
+							answers[q_idx] = ans
+					except Exception:
+						continue
+
+				# If we got at least one valid answer, return the list
+				if any(a is not None for a in answers):
+					return answers
 				else:
-					continue  # Invalid index, try next
+					continue
 			except Exception as e:
 				if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
 					print(f"Quota exceeded on {model} with key {current_idx + 1}. Switching to next key...")
@@ -220,8 +237,8 @@ def ask_gemini(question: str, options: List[str]) -> int:
 		current_idx = current_api_key_idx
 		if switch_key:
 			continue
-	
-	return 1
+
+	return [None for _ in questions]
 
 
 # ----------------------------
@@ -325,22 +342,25 @@ def run(url: str) -> None:
 			print(f"\nScanning page {visited} for MCQs...")
 			mcqs = extract_mcqs(driver)
 
-			for i, q in enumerate(mcqs):
-				if not q.options:
-					continue
-				print(f"Q{i+1}: {q.question_text[:80]}{'...' if len(q.question_text) > 80 else ''}")
-				print(f" - Options: {len(q.options)}")
-				try:
-					ans_idx = ask_gemini(q.question_text, q.options)
+			batch_size = 5
+			for start in range(0, len(mcqs), batch_size):
+				batch = mcqs[start:start + batch_size]
+				answers = ask_gemini_batch(batch)
+				for j, q in enumerate(batch):
+					q_idx = start + j
+					ans_idx = answers[j] if j < len(answers) else None
+					print(f"Q{q_idx+1}: {q.question_text[:80]}{'...' if len(q.question_text) > 80 else ''}")
+					print(f" - Options: {len(q.options)}")
+					if ans_idx is None:
+						print(" - Failed to get answer. Skipping question.")
+						skipped_questions.append(f"Page {visited}, Q{q_idx+1}: {q.question_text[:50]}...")
+						continue
 					print(f" - Gemini suggests option #{ans_idx}")
 					try:
-						select_answer(driver, i, ans_idx)
+						select_answer(driver, q_idx, ans_idx)
 						time.sleep(0.2)
 					except Exception as e:
 						print(f" - Selection error: {e}")
-				except ValueError as e:
-					print(f" - Failed to get answer: {e}. Skipping question.")
-					skipped_questions.append(f"Page {visited}, Q{i+1}: {q.question_text[:50]}...")
 
 			prev_sig = _page_signature(driver)
 			if _has_next_button(driver):

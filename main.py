@@ -98,6 +98,7 @@ def extract_mcqs(driver) -> List[MCQ]:
 		# Get question text
 		q_headings = card.find_elements(By.CSS_SELECTOR, "[role='heading']")
 		question_text = q_headings[0].text.strip() if q_headings else card.text.split("\n")[0].strip()
+		question_text = re.sub(r'\[.*?\]', '', question_text).strip()
 		if not question_text:
 			continue
 

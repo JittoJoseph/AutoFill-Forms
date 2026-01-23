@@ -32,7 +32,7 @@ def ask_gemini_batch(questions: List[MCQ]) -> List[Optional[int]]:
 		print("No API keys set. Skipping batch.")
 		return [None for _ in questions]
 
-	models = ["gemini-3-flash-preview", "gemini-2.5-flash"]  # Priority order
+	models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]  # Priority order
 
 	items = []
 	for i, q in enumerate(questions, start=1):
@@ -59,6 +59,9 @@ def ask_gemini_batch(questions: List[MCQ]) -> List[Optional[int]]:
 		for model in models:
 			try:
 				response = client.models.generate_content(model=model, contents=prompt)
+				if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
+					print(f"No valid response from {model}. Trying next model...")
+					continue
 				text = "".join([part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')])
 
 				try:

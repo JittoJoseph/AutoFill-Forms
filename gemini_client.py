@@ -18,10 +18,9 @@ def _coerce_api_key(val: Optional[str]) -> Optional[str]:
 
 
 def _get_api_keys() -> List[str]:
-	keys = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
-	if not keys:
-		keys = [_coerce_api_key(os.getenv("GEMINI_API_KEY")), _coerce_api_key(os.getenv("GEMINI_API_KEY_2"))]
-		keys = [k for k in keys if k]
+	raw_keys = os.getenv("GEMINI_API_KEYS", "").split(",")
+	keys = [_coerce_api_key(k) for k in raw_keys]
+	keys = [k for k in keys if k]
 	return keys
 
 
